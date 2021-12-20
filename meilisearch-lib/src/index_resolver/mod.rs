@@ -212,7 +212,6 @@ where
                 id,
                 content:
                     TaskContent::DocumentAddition {
-                        content_uuid,
                         merge_strategy,
                         primary_key,
                         ..
@@ -220,7 +219,6 @@ where
                 ..
             })) => {
                 let primary_key = primary_key.clone();
-                let content_uuid = *content_uuid;
                 let method = *merge_strategy;
 
                 let index = self
@@ -273,12 +271,7 @@ where
     async fn process_task(&self, task: &Task) -> Result<TaskResult> {
         let index_uid = task.index_uid.clone();
         match &task.content {
-            TaskContent::DocumentAddition {
-                content_uuid,
-                merge_strategy,
-                primary_key,
-                ..
-            } => panic!("updates should be handled by batch"),
+            TaskContent::DocumentAddition { .. } => panic!("updates should be handled by batch"),
             TaskContent::DocumentDeletion(DocumentDeletion::Ids(ids)) => {
                 let ids = ids.clone();
                 let index = self.get_index(index_uid.into_inner()).await?;

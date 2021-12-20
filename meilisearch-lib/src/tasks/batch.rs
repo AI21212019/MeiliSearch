@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 
 use super::{task::Task, task_store::Pending};
 
-pub type BatchId = u32;
+pub type BatchId = u64;
 
 #[derive(Debug)]
 pub struct Batch {

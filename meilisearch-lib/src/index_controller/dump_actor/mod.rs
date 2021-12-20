@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use log::{info, trace, warn};
@@ -11,15 +12,15 @@ pub use actor::DumpActor;
 pub use handle_impl::*;
 pub use message::DumpMsg;
 use tokio::fs::create_dir_all;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, RwLock};
 
 use crate::analytics;
-use crate::compression::{from_tar_gz, to_tar_gz};
-use crate::index_controller::dump_actor::error::DumpActorError;
+use crate::compression::from_tar_gz;
+// use crate::index_controller::dump_actor::error::DumpActorError;
 use crate::index_controller::dump_actor::loaders::{v2, v3, v4};
 use crate::options::IndexerOpts;
 use crate::tasks::task::Job;
-use crate::tasks::TaskStore;
+use crate::tasks::Scheduler;
 use crate::update_file_store::UpdateFileStore;
 use error::Result;
 
@@ -234,11 +235,12 @@ pub fn load_dump(
     Ok(())
 }
 
+#[allow(dead_code)]
 struct DumpJob {
     dump_path: PathBuf,
     db_path: PathBuf,
     update_file_store: UpdateFileStore,
-    task_store: TaskStore,
+    scheduler: Arc<RwLock<Scheduler>>,
     uid: String,
     update_db_size: usize,
     index_db_size: usize,
@@ -263,36 +265,45 @@ impl DumpJob {
 
         let (sender, receiver) = oneshot::channel();
 
-        self.task_store
-            .register_job(Job::Dump {
+        self.scheduler
+            .write()
+            .await
+            .schedule_job(Job::Dump {
                 ret: sender,
                 path: temp_dump_path.clone(),
             })
             .await;
+
         receiver.await??;
-        self.task_store
-            .dump(&temp_dump_path, self.update_file_store.clone())
-            .await?;
 
-        let dump_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
-            // for now we simply copy the updates/updates_files
-            // FIXME: We may copy more files than necessary, if new files are added while we are
-            // performing the dump. We need a way to filter them out.
+        // TODO(marin): this is not right, the scheduler should dump iteself, not do it here...
+        // self.scheduler
+        //     .read()
+        //     .await
+        //     .dump(&temp_dump_path, self.update_file_store.clone())
+        //     .await?;
 
-            let temp_dump_file = tempfile::NamedTempFile::new_in(&self.dump_path)?;
-            to_tar_gz(temp_dump_path, temp_dump_file.path())
-                .map_err(|e| DumpActorError::Internal(e.into()))?;
+        todo!("implement proper task store dumping");
 
-            let dump_path = self.dump_path.join(self.uid).with_extension("dump");
-            temp_dump_file.persist(&dump_path)?;
-
-            Ok(dump_path)
-        })
-        .await??;
-
-        info!("Created dump in {:?}.", dump_path);
-
-        Ok(())
+        // let dump_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        //     // for now we simply copy the updates/updates_files
+        //     // FIXME: We may copy more files than necessary, if new files are added while we are
+        //     // performing the dump. We need a way to filter them out.
+        //
+        //     let temp_dump_file = tempfile::NamedTempFile::new_in(&self.dump_path)?;
+        //     to_tar_gz(temp_dump_path, temp_dump_file.path())
+        //         .map_err(|e| DumpActorError::Internal(e.into()))?;
+        //
+        //     let dump_path = self.dump_path.join(self.uid).with_extension("dump");
+        //     temp_dump_file.persist(&dump_path)?;
+        //
+        //     Ok(dump_path)
+        // })
+        // .await??;
+        //
+        // info!("Created dump in {:?}.", dump_path);
+        //
+        // Ok(())
     }
 }
 

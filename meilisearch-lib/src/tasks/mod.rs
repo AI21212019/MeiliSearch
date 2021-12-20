@@ -1,19 +1,16 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+pub use scheduler::Scheduler;
+pub use task_store::{Pending, TaskFilter};
 
 #[cfg(test)]
 pub use task_store::test::MockTaskStore as TaskStore;
 #[cfg(not(test))]
 pub use task_store::TaskStore;
 
-pub use task_store::{Pending, TaskFilter};
-
 use batch::Batch;
 use error::Result;
-use update_loop::UpdateLoop;
 
 pub mod batch;
 pub mod error;
@@ -31,16 +28,6 @@ pub trait TaskPerformer: Sync + Send + 'static {
     /// `finish` is called when the result of `process` has been commited to the task store. This
     /// method can be used to perform cleanup after the update has been completed for example.
     async fn finish(&self, batch: &Batch);
-}
-
-pub fn create_task_store<P>(env: heed::Env, performer: Arc<P>) -> Result<TaskStore>
-where
-    P: TaskPerformer,
-{
-    let task_store = TaskStore::new(env)?;
-    let scheduler = UpdateLoop::new(task_store.clone(), performer, Duration::from_millis(1));
-    tokio::task::spawn_local(scheduler.run());
-    Ok(task_store)
 }
 
 #[cfg(test)]

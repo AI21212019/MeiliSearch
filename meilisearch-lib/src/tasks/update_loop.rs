@@ -3,15 +3,12 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 use super::batch::Batch;
 use super::error::Result;
-#[cfg(test)]
-use super::task_store::test::MockTaskStore as TaskStore;
 use super::task_store::Pending;
-#[cfg(not(test))]
-use super::task_store::TaskStore;
-use super::TaskPerformer;
+use super::{Scheduler, TaskPerformer};
 use crate::tasks::task::TaskEvent;
 
 /// The scheduler roles is to perform batches of tasks one at a time. It will monitor the TaskStore
@@ -19,7 +16,7 @@ use crate::tasks::task::TaskEvent;
 ///
 /// When a batch is currently processing, the scheduler is just waiting.
 pub struct UpdateLoop<P: TaskPerformer> {
-    store: TaskStore,
+    scheduler: Arc<RwLock<Scheduler>>,
     performer: Arc<P>,
 
     /// The interval at which the the `TaskStore` should be checked for new updates
@@ -31,9 +28,13 @@ where
     P: TaskPerformer + Send + Sync + 'static,
     P::Error: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
 {
-    pub fn new(store: TaskStore, performer: Arc<P>, task_store_check_interval: Duration) -> Self {
+    pub fn new(
+        scheduler: Arc<RwLock<Scheduler>>,
+        performer: Arc<P>,
+        task_store_check_interval: Duration,
+    ) -> Self {
         Self {
-            store,
+            scheduler,
             performer,
             task_store_check_interval,
         }
@@ -48,7 +49,8 @@ where
     }
 
     async fn process_next_batch(&self) -> Result<()> {
-        match self.prepare_batch().await? {
+        let batch = { self.scheduler.write().await.prepare_batch().await? };
+        match batch {
             Some(mut batch) => {
                 for task in &mut batch.tasks {
                     match task {
@@ -58,10 +60,18 @@ where
                 }
 
                 // the jobs are ignored
-                batch.tasks = self.store.update_tasks(batch.tasks).await?;
+                batch.tasks = {
+                    self.scheduler
+                        .read()
+                        .await
+                        .update_tasks(batch.tasks)
+                        .await?
+                };
 
                 let performer = self.performer.clone();
+
                 let batch_result = performer.process(batch).await;
+
                 self.handle_batch_result(batch_result).await?;
             }
             None => {
@@ -73,46 +83,17 @@ where
         Ok(())
     }
 
-    /// Checks for pending tasks and groups them in a batch. If there are no pending update,
-    /// return Ok(None)
-    ///
-    /// Until batching is properly implemented, the batches contain only one task.
-    async fn prepare_batch(&self) -> Result<Option<Batch>> {
-        match self.store.peek_pending_task().await {
-            Some(Pending::Task(next_task_id)) => {
-                let mut task = self.store.get_task(next_task_id, None).await?;
-
-                task.events.push(TaskEvent::Batched {
-                    timestamp: Utc::now(),
-                    batch_id: 0,
-                });
-
-                let batch = Batch {
-                    id: 0,
-                    // index_uid: task.index_uid.clone(),
-                    created_at: Utc::now(),
-                    tasks: vec![Pending::Task(task)],
-                };
-                Ok(Some(batch))
-            }
-            Some(Pending::Job(job)) => Ok(Some(Batch {
-                id: 0,
-                created_at: Utc::now(),
-                tasks: vec![Pending::Job(job)],
-            })),
-            None => Ok(None),
-        }
-    }
-
     /// Handles the result from a batch processing.
     ///
     /// When a task is processed, the result of the processing is pushed to its event list. The
     /// handle batch result make sure that the new state is save into its store.
     /// The tasks are then removed from the processing queue.
     async fn handle_batch_result(&self, mut batch: Batch) -> Result<()> {
-        let tasks = self.store.update_tasks(batch.tasks).await?;
+        let mut scheduler = self.scheduler.write().await;
+        let tasks = scheduler.update_tasks(batch.tasks).await?;
+        scheduler.finish();
+        drop(scheduler);
         batch.tasks = tasks;
-        self.store.delete_pending(&batch.tasks[0]).await;
         self.performer.finish(&batch).await;
         Ok(())
     }

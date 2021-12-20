@@ -1,7 +1,7 @@
 mod store;
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -9,7 +9,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use heed::{Env, RwTxn};
 use log::debug;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::error::TaskError;
@@ -101,28 +100,20 @@ impl Ord for Pending<TaskId> {
 
 pub struct TaskStore {
     store: Arc<Store>,
-    pending_queue: Arc<RwLock<BinaryHeap<Pending<TaskId>>>>,
 }
 
 impl Clone for TaskStore {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
-            pending_queue: self.pending_queue.clone(),
         }
     }
 }
 
 impl TaskStore {
     pub fn new(env: heed::Env) -> Result<Self> {
-        let mut store = Store::new(env)?;
-        let unfinished_tasks = store.reset_and_return_unfinished_tasks()?;
-        let store = Arc::new(store);
-
-        Ok(Self {
-            store,
-            pending_queue: Arc::new(RwLock::new(unfinished_tasks)),
-        })
+        let store = Arc::new(Store::new(env)?);
+        Ok(Self { store })
     }
 
     pub async fn register(&self, index_uid: IndexUid, content: TaskContent) -> Result<Task> {
@@ -146,46 +137,12 @@ impl TaskStore {
         })
         .await??;
 
-        self.pending_queue
-            .write()
-            .await
-            .push(Pending::Task(task.id));
-
         Ok(task)
     }
 
     pub fn register_raw_update(&self, wtxn: &mut RwTxn, task: &Task) -> Result<()> {
         self.store.put(wtxn, task)?;
         Ok(())
-    }
-
-    /// Register an update that applies on multiple indexes.
-    /// Currently the update is considered as a priority.
-    pub async fn register_job(&self, content: Job) {
-        debug!("registering a job: {:?}", content);
-        self.pending_queue.write().await.push(Pending::Job(content));
-    }
-
-    /// Returns the next task to process.
-    pub async fn peek_pending_task(&self) -> Option<Pending<TaskId>> {
-        let mut pending_queue = self.pending_queue.write().await;
-        loop {
-            match pending_queue.peek()? {
-                Pending::Job(Job::Empty) => drop(pending_queue.pop()),
-                _ => return Some(pending_queue.peek_mut()?.take()),
-            }
-        }
-    }
-
-    /// Returns the next task to process if there is one.
-    pub async fn get_processing_task(&self) -> Result<Option<Task>> {
-        match self.peek_pending_task().await {
-            Some(Pending::Task(tid)) => {
-                let task = self.get_task(tid, None).await?;
-                Ok(matches!(task.events.last(), Some(TaskEvent::Processing(_))).then(|| task))
-            }
-            _ => Ok(None),
-        }
     }
 
     pub async fn get_task(&self, id: TaskId, filter: Option<TaskFilter>) -> Result<Task> {
@@ -251,21 +208,6 @@ impl TaskStore {
         .await??;
 
         Ok(tasks)
-    }
-
-    /// Delete one task from the queue and remove all `Empty` job.
-    pub async fn delete_pending(&self, to_delete: &Pending<Task>) {
-        if let Pending::Task(Task { id: pending_id, .. }) = to_delete {
-            let mut pending_queue = self.pending_queue.write().await;
-            *pending_queue = std::mem::take(&mut *pending_queue)
-                .into_iter()
-                .filter(|pending| match pending {
-                    Pending::Job(Job::Empty) => false,
-                    Pending::Task(id) => pending_id != id,
-                    _ => true,
-                })
-                .collect::<BinaryHeap<Pending<TaskId>>>();
-        }
     }
 
     pub async fn list_tasks(

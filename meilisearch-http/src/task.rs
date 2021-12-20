@@ -2,6 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use meilisearch_error::ResponseError;
 use meilisearch_lib::index::{Settings, Unchecked};
 use meilisearch_lib::milli::update::IndexDocumentsMethod;
+use meilisearch_lib::tasks::batch::BatchId;
 use meilisearch_lib::tasks::task::{
     DocumentDeletion, Task, TaskContent, TaskEvent, TaskId, TaskResult,
 };
@@ -106,6 +107,7 @@ pub struct TaskView {
     enqueued_at: DateTime<Utc>,
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
+    batch_id: Option<BatchId>,
 }
 
 impl From<Task> for TaskView {
@@ -231,6 +233,11 @@ impl From<Task> for TaskView {
             _ => None,
         });
 
+        let batch_id = events.iter().find_map(|e| match e {
+            TaskEvent::Batched { batch_id, .. } => Some(*batch_id),
+            _ => None,
+        });
+
         Self {
             uid: id,
             index_uid: index_uid.into_inner(),
@@ -242,6 +249,7 @@ impl From<Task> for TaskView {
             enqueued_at,
             started_at,
             finished_at,
+            batch_id,
         }
     }
 }

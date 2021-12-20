@@ -1,19 +1,24 @@
 use std::{
-    cell::{Ref, RefCell},
     cmp::Ordering,
     collections::{hash_map::Entry, BinaryHeap, HashMap, VecDeque},
     ops::{Deref, DerefMut},
-    rc::Rc,
+    sync::Arc,
+    time::Duration,
 };
 
+use atomic_refcell::AtomicRefCell;
 use chrono::Utc;
+use tokio::sync::RwLock;
+
+use crate::index_resolver::IndexUid;
 
 use super::{
     batch::Batch,
     error::Result,
-    task::{Task, TaskContent, TaskId},
+    task::{Job, Task, TaskContent, TaskEvent, TaskId},
     task_store::TaskStore,
-    Pending,
+    update_loop::UpdateLoop,
+    Pending, TaskFilter, TaskPerformer,
 };
 
 #[derive(Eq, PartialEq, Debug, Clone, Copy)]
@@ -102,9 +107,9 @@ impl PartialOrd for TaskList {
 #[derive(Default)]
 struct TaskQueue {
     /// maps index uids to their TaskList, for quick access
-    index_tasks: HashMap<String, Rc<RefCell<TaskList>>>,
+    index_tasks: HashMap<String, Arc<AtomicRefCell<TaskList>>>,
     /// A queue that orders TaskList by the priority of their fist update
-    queue: BinaryHeap<Rc<RefCell<TaskList>>>,
+    queue: BinaryHeap<Arc<AtomicRefCell<TaskList>>>,
 }
 
 impl TaskQueue {
@@ -133,7 +138,7 @@ impl TaskQueue {
             Entry::Vacant(entry) => {
                 let mut task_list = TaskList::new(entry.key().to_owned());
                 task_list.push(task);
-                let task_list = Rc::new(RefCell::new(task_list));
+                let task_list = Arc::new(AtomicRefCell::new(task_list));
                 entry.insert(task_list.clone());
                 self.queue.push(task_list);
             }
@@ -142,10 +147,6 @@ impl TaskQueue {
 
     fn is_empty(&self) -> bool {
         self.queue.is_empty() && self.index_tasks.is_empty()
-    }
-
-    fn head(&self) -> Option<Ref<TaskList>> {
-        self.queue.peek().map(|t| t.borrow())
     }
 
     /// passes a context with a view to the task list of the next index to schedule. It is
@@ -160,7 +161,7 @@ impl TaskQueue {
             // After being mutated, the head is reinserted to the correct position.
             self.queue.push(head);
         } else {
-            self.index_tasks.remove(dbg!(&head.borrow().index));
+            self.index_tasks.remove(&head.borrow().index);
         }
 
         Some(result)
@@ -174,8 +175,8 @@ struct PendingQueue {
 }
 
 impl PendingQueue {
-    fn register(&mut self, task: Pending<Task>) {
-        match task {
+    fn register(&mut self, pending: Pending<Task>) {
+        match pending {
             Pending::Task(t) => {
                 self.tasks.insert(t);
             }
@@ -190,15 +191,88 @@ impl PendingQueue {
     }
 }
 
-struct Scheduler {
+pub struct Scheduler {
     pending_queue: PendingQueue,
     store: TaskStore,
     processing: Vec<TaskId>,
 }
 
 impl Scheduler {
+    pub fn new<P>(env: heed::Env, performer: Arc<P>) -> Result<Arc<RwLock<Self>>>
+    where
+        P: TaskPerformer,
+    {
+        let store = TaskStore::new(env)?;
+        let this = Self {
+            pending_queue: PendingQueue::default(),
+            store,
+            processing: Vec::new(),
+        };
+
+        let this = Arc::new(RwLock::new(this));
+
+        // TODO(marin): make the scheduling interval a setting
+        let update_loop = UpdateLoop::new(this.clone(), performer, Duration::from_millis(1000));
+
+        tokio::task::spawn_local(update_loop.run());
+
+        Ok(this)
+    }
+
+    pub async fn register_task(
+        &mut self,
+        index_uid: IndexUid,
+        content: TaskContent,
+    ) -> Result<Task> {
+        let task = self.store.register(index_uid, content).await?;
+
+        let pending = Pending::Task(task.clone());
+        self.pending_queue.register(pending);
+
+        Ok(task)
+    }
+
+    /// Clears the processing list, this method should be called when the processing of a batch is
+    /// finished.
+    pub fn finish(&mut self) {
+        self.processing.clear();
+    }
+
+    pub async fn update_tasks(&self, tasks: Vec<Pending<Task>>) -> Result<Vec<Pending<Task>>> {
+        self.store.update_tasks(tasks).await
+    }
+
+    pub async fn get_task(&self, id: TaskId, filter: Option<TaskFilter>) -> Result<Task> {
+        self.store.get_task(id, filter).await
+    }
+
+    pub async fn list_tasks(
+        &self,
+        offset: Option<TaskId>,
+        filter: Option<TaskFilter>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Task>> {
+        self.store.list_tasks(offset, filter, limit).await
+    }
+
+    pub async fn get_processing_tasks(&self) -> Result<Vec<Task>> {
+        let mut tasks = Vec::new();
+
+        for id in self.processing.iter() {
+            let task = self.store.get_task(*id, None).await?;
+            tasks.push(task);
+        }
+
+        Ok(tasks)
+    }
+
+    pub async fn schedule_job(&mut self, job: Job) {
+        let pending = Pending::Job(job);
+        self.pending_queue.register(pending);
+    }
+
     /// Prepares the next batch, and set `processing` to the ids in that batch.
-    async fn prepare_batch(&mut self) -> Result<Option<Batch>> {
+    pub async fn prepare_batch(&mut self) -> Result<Option<Batch>> {
         self.processing.clear();
         if let Some(Pending::Job(job)) = self.pending_queue.jobs.pop_back() {
             Ok(Some(Batch {
@@ -211,11 +285,27 @@ impl Scheduler {
             if !self.processing.is_empty() {
                 let ids = std::mem::take(&mut self.processing);
 
-                let (ids, tasks) = self.store.get_pending_tasks(ids).await?;
+                let (ids, mut tasks) = self.store.get_pending_tasks(ids).await?;
+
+                // The batch id is the id of the first update it contains
+                let id = match tasks.first() {
+                    Some(Pending::Task(Task { id, .. })) => *id,
+                    _ => panic!("invalid batch"),
+                };
+
+                tasks.iter_mut().for_each(|t| {
+                    if let Pending::Task(Task { ref mut events, .. }) = t {
+                        events.push(TaskEvent::Batched {
+                            batch_id: id,
+                            timestamp: Utc::now(),
+                        })
+                    }
+                });
 
                 self.processing = ids;
+
                 let batch = Batch {
-                    id: 0,
+                    id,
                     created_at: Utc::now(),
                     tasks,
                 };
