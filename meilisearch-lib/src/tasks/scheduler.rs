@@ -180,11 +180,17 @@ impl PendingQueue {
     }
 }
 
+struct SchedulerConfig {
+    // The maximum number of updates that can be batched together. If None, this is unlimited.
+    max_batch_size: Option<usize>,
+}
+
 pub struct Scheduler {
     pending_queue: PendingQueue,
     store: TaskStore,
     processing: Vec<TaskId>,
     last_fetched_task_id: TaskId,
+    config: SchedulerConfig,
 }
 
 impl Scheduler {
@@ -192,11 +198,15 @@ impl Scheduler {
     where
         P: TaskPerformer,
     {
+        let config = SchedulerConfig {
+            max_batch_size: None,
+        };
         let this = Self {
             pending_queue: PendingQueue::default(),
             store,
             processing: Vec::new(),
             last_fetched_task_id: 0,
+            config,
         };
 
         let this = Arc::new(RwLock::new(this));
@@ -281,7 +291,7 @@ impl Scheduler {
                 tasks: vec![Pending::Job(job)],
             }))
         } else {
-            make_batch(&mut self.pending_queue, &mut self.processing);
+            make_batch(&mut self.pending_queue, &mut self.processing, &self.config);
             if !self.processing.is_empty() {
                 let ids = std::mem::take(&mut self.processing);
 
@@ -318,7 +328,11 @@ impl Scheduler {
     }
 }
 
-fn make_batch(pending_queue: &mut PendingQueue, processing: &mut Vec<TaskId>) {
+fn make_batch(
+    pending_queue: &mut PendingQueue,
+    processing: &mut Vec<TaskId>,
+    config: &SchedulerConfig,
+) {
     pending_queue
         .tasks
         .head_mut(|list| match list.peek().copied() {
@@ -331,10 +345,13 @@ fn make_batch(pending_queue: &mut PendingQueue, processing: &mut Vec<TaskId>) {
             }
             Some(PendingTask { kind, .. }) => loop {
                 match list.peek() {
-                    Some(pending) if pending.kind == kind => {
-                        processing.push(pending.id);
-                        list.pop();
-                    }
+                    Some(pending) if pending.kind == kind => match config.max_batch_size {
+                        Some(limit) if processing.len() >= limit => break,
+                        _ => {
+                            processing.push(pending.id);
+                            list.pop();
+                        }
+                    },
                     _ => break,
                 }
             },
