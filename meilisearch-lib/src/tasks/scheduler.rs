@@ -8,7 +8,10 @@ use std::{
 
 use atomic_refcell::AtomicRefCell;
 use chrono::Utc;
+use milli::update::IndexDocumentsMethod;
 use tokio::sync::RwLock;
+
+use crate::options::SchedulerConfig;
 
 use super::{
     batch::Batch,
@@ -18,10 +21,22 @@ use super::{
     Pending, TaskFilter, TaskPerformer, TaskStore,
 };
 
-#[derive(Eq, PartialEq, Debug, Clone, Copy)]
+#[derive(Eq, Debug, Clone, Copy)]
 enum TaskType {
-    DocumentAddition,
+    DocumentAddition { number: usize },
+    DocumentsUpdate { number: usize },
     Other,
+}
+
+/// Two task types are equal if they hace the same type
+impl PartialEq for TaskType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::DocumentAddition { .. }, Self::DocumentAddition { .. })
+            | (Self::DocumentsUpdate { .. }, Self::DocumentsUpdate { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Eq, Debug, Clone, Copy)]
@@ -114,7 +129,20 @@ impl TaskQueue {
         let uid = task.index_uid.into_inner();
         let id = task.id;
         let kind = match task.content {
-            TaskContent::DocumentAddition { .. } => TaskType::DocumentAddition,
+            TaskContent::DocumentAddition {
+                documents_count,
+                merge_strategy: IndexDocumentsMethod::ReplaceDocuments,
+                ..
+            } => TaskType::DocumentAddition {
+                number: documents_count,
+            },
+            TaskContent::DocumentAddition {
+                documents_count,
+                merge_strategy: IndexDocumentsMethod::UpdateDocuments,
+                ..
+            } => TaskType::DocumentsUpdate {
+                number: documents_count,
+            },
             _ => TaskType::Other,
         };
         let task = PendingTask { kind, id };
@@ -180,11 +208,6 @@ impl PendingQueue {
     }
 }
 
-struct SchedulerConfig {
-    // The maximum number of updates that can be batched together. If None, this is unlimited.
-    max_batch_size: Option<usize>,
-}
-
 pub struct Scheduler {
     pending_queue: PendingQueue,
     store: TaskStore,
@@ -194,13 +217,14 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new<P>(store: TaskStore, performer: Arc<P>) -> Result<Arc<RwLock<Self>>>
+    pub fn new<P>(
+        store: TaskStore,
+        performer: Arc<P>,
+        config: SchedulerConfig,
+    ) -> Result<Arc<RwLock<Self>>>
     where
         P: TaskPerformer,
     {
-        let config = SchedulerConfig {
-            max_batch_size: None,
-        };
         let this = Self {
             pending_queue: PendingQueue::default(),
             store,
@@ -333,6 +357,10 @@ fn make_batch(
     processing: &mut Vec<TaskId>,
     config: &SchedulerConfig,
 ) {
+    // the processing list MUST be empty when it is handed to us.
+    assert!(processing.is_empty());
+
+    let mut doc_count = 0;
     pending_queue
         .tasks
         .head_mut(|list| match list.peek().copied() {
@@ -346,10 +374,28 @@ fn make_batch(
             Some(PendingTask { kind, .. }) => loop {
                 match list.peek() {
                     Some(pending) if pending.kind == kind => match config.max_batch_size {
-                        Some(limit) if processing.len() >= limit => break,
+                        Some(limit) if processing.len() >= limit.max(1) => break,
                         _ => {
+                            let pending = list.pop().unwrap();
                             processing.push(pending.id);
-                            list.pop();
+
+                            // add the number of documents to count if we are scheduling document additions and
+                            // stop adding if we already have enough. We check that bound only
+                            // after adding the task to the batch, so a single update is always
+                            // processed even if it has to any documents in it.
+                            match pending.kind {
+                                TaskType::DocumentsUpdate { number }
+                                | TaskType::DocumentAddition { number } => {
+                                    doc_count += number;
+
+                                    if doc_count
+                                        >= config.max_documents_per_batch.unwrap_or(usize::MAX)
+                                    {
+                                        break;
+                                    }
+                                }
+                                _ => (),
+                            }
                         }
                     },
                     _ => break,

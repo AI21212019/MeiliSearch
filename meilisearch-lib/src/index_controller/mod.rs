@@ -22,7 +22,7 @@ use crate::index::{
     Checked, Document, IndexMeta, IndexStats, SearchQuery, SearchResult, Settings, Unchecked,
 };
 use crate::index_controller::dump_actor::{load_dump, DumpActor, DumpActorHandleImpl};
-use crate::options::IndexerOpts;
+use crate::options::{IndexerOpts, SchedulerConfig};
 use crate::snapshot::{load_snapshot, SnapshotService};
 use crate::tasks::error::TaskError;
 use crate::tasks::task::{DocumentDeletion, Task, TaskContent, TaskId};
@@ -156,6 +156,7 @@ impl IndexControllerBuilder {
         self,
         db_path: impl AsRef<Path>,
         indexer_options: IndexerOpts,
+        scheduler_config: SchedulerConfig,
     ) -> anyhow::Result<MeiliSearch> {
         let index_size = self
             .max_index_size
@@ -208,7 +209,8 @@ impl IndexControllerBuilder {
         )?);
 
         let task_store = TaskStore::new(meta_env)?;
-        let scheduler = Scheduler::new(task_store.clone(), index_resolver.clone())?;
+        let scheduler =
+            Scheduler::new(task_store.clone(), index_resolver.clone(), scheduler_config)?;
 
         let dump_path = self
             .dump_dst

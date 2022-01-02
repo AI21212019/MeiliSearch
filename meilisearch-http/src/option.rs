@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use byte_unit::Byte;
-use meilisearch_lib::options::IndexerOpts;
+use meilisearch_lib::options::{IndexerOpts, SchedulerConfig};
 use rustls::internal::pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use rustls::{
     AllowAnyAnonymousOrAuthenticatedClient, AllowAnyAuthenticatedClient, NoClientAuth,
@@ -126,6 +126,9 @@ pub struct Opt {
 
     #[structopt(skip)]
     pub indexer_options: IndexerOpts,
+
+    #[structopt(flatten, hidden = true)]
+    pub scheduler_options: SchedulerConfig,
 }
 
 impl Opt {

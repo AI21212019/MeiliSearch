@@ -43,6 +43,20 @@ pub struct IndexerOpts {
     pub indexing_jobs: Option<usize>,
 }
 
+#[derive(Debug, Clone, StructOpt)]
+pub struct SchedulerConfig {
+    // The maximum number of updates that can be batched together. If None, this is unlimited. A
+    // value of 0 is interpreted as 1.
+    #[structopt(long)]
+    pub max_batch_size: Option<usize>,
+
+    // The maximum number of documents in a document batch. Since batch must contain at least one
+    // batch for the schedulet to be able to make progress, this is ignored if a single update contains
+    // more updates that what is specified.
+    #[structopt(long)]
+    pub max_documents_per_batch: Option<usize>,
+}
+
 impl TryFrom<&IndexerOpts> for IndexerConfig {
     type Error = anyhow::Error;
 
