@@ -26,7 +26,7 @@ use crate::options::IndexerOpts;
 use crate::snapshot::{load_snapshot, SnapshotService};
 use crate::tasks::error::TaskError;
 use crate::tasks::task::{DocumentDeletion, Task, TaskContent, TaskId};
-use crate::tasks::{Scheduler, TaskFilter};
+use crate::tasks::{Scheduler, TaskFilter, TaskStore};
 use error::Result;
 
 use self::dump_actor::{DumpActorHandle, DumpInfo};
@@ -67,6 +67,7 @@ pub struct IndexSettings {
 pub struct IndexController<U, I> {
     index_resolver: Arc<IndexResolver<U, I>>,
     scheduler: Arc<RwLock<Scheduler>>,
+    task_store: TaskStore,
     dump_handle: dump_actor::DumpActorHandleImpl,
     update_file_store: UpdateFileStore,
 }
@@ -79,6 +80,7 @@ impl<U, I> Clone for IndexController<U, I> {
             scheduler: self.scheduler.clone(),
             dump_handle: self.dump_handle.clone(),
             update_file_store: self.update_file_store.clone(),
+            task_store: self.task_store.clone(),
         }
     }
 }
@@ -205,7 +207,8 @@ impl IndexControllerBuilder {
             update_file_store.clone(),
         )?);
 
-        let scheduler = Scheduler::new(meta_env, index_resolver.clone())?;
+        let task_store = TaskStore::new(meta_env)?;
+        let scheduler = Scheduler::new(task_store.clone(), index_resolver.clone())?;
 
         let dump_path = self
             .dump_dst
@@ -253,6 +256,7 @@ impl IndexControllerBuilder {
             scheduler,
             dump_handle,
             update_file_store,
+            task_store,
         })
     }
 
@@ -385,12 +389,7 @@ where
             Update::UpdateIndex { primary_key } => TaskContent::IndexUpdate { primary_key },
         };
 
-        let task = self
-            .scheduler
-            .write()
-            .await
-            .register_task(uid, content)
-            .await?;
+        let task = self.task_store.register(uid, content).await?;
 
         Ok(task)
     }

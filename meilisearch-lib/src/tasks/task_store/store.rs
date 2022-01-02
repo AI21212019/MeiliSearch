@@ -18,7 +18,7 @@ use crate::tasks::task::{Task, TaskId};
 
 use super::super::Result;
 
-use super::{Pending, TaskFilter};
+use super::TaskFilter;
 
 enum IndexUidTaskIdCodec {}
 
@@ -73,41 +73,6 @@ impl Store {
             uids_task_ids,
             tasks,
         })
-    }
-
-    /// This function should be called *right after* creating the store.
-    /// It put back all unfinished update in the `Created` state. This
-    /// allow us to re-enqueue an update that didn't had the time to finish
-    /// when Meilisearch closed.
-    pub fn reset_and_return_unfinished_tasks(&mut self) -> Result<BinaryHeap<Pending<TaskId>>> {
-        let mut unfinished_tasks: BinaryHeap<Pending<TaskId>> = BinaryHeap::new();
-
-        let mut wtxn = self.wtxn()?;
-        let mut iter = self.tasks.rev_iter_mut(&mut wtxn)?;
-
-        while let Some(entry) = iter.next() {
-            let entry = entry?;
-            let (id, mut task): (BEU64, Task) = entry;
-
-            // Since all tasks are ordered, we can stop iterating when we encounter our first non-finished task.
-            if task.is_finished() {
-                break;
-            }
-
-            // we only keep the first state. It’s supposed to be a `Created` state.
-            task.events.drain(1..);
-            unfinished_tasks.push(Pending::Task(id.get()));
-
-            // Since we own the id and the task this is a safe operation.
-            unsafe {
-                iter.put_current(&id, &task)?;
-            }
-        }
-
-        drop(iter);
-        wtxn.commit()?;
-
-        Ok(unfinished_tasks)
     }
 
     pub fn wtxn(&self) -> Result<RwTxn> {

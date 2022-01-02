@@ -10,15 +10,12 @@ use atomic_refcell::AtomicRefCell;
 use chrono::Utc;
 use tokio::sync::RwLock;
 
-use crate::index_resolver::IndexUid;
-
 use super::{
     batch::Batch,
     error::Result,
     task::{Job, Task, TaskContent, TaskEvent, TaskId},
-    task_store::TaskStore,
     update_loop::UpdateLoop,
-    Pending, TaskFilter, TaskPerformer,
+    Pending, TaskFilter, TaskPerformer, TaskStore,
 };
 
 #[derive(Eq, PartialEq, Debug, Clone, Copy)]
@@ -145,10 +142,6 @@ impl TaskQueue {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty() && self.index_tasks.is_empty()
-    }
-
     /// passes a context with a view to the task list of the next index to schedule. It is
     /// guaranteed that the first id from task list will be the lowest pending task id.
     fn head_mut<R>(&mut self, mut f: impl FnMut(&mut TaskList) -> R) -> Option<R> {
@@ -185,28 +178,25 @@ impl PendingQueue {
             }
         }
     }
-
-    fn is_empty(&self) -> bool {
-        self.jobs.is_empty() && self.tasks.is_empty()
-    }
 }
 
 pub struct Scheduler {
     pending_queue: PendingQueue,
     store: TaskStore,
     processing: Vec<TaskId>,
+    last_fetched_task_id: TaskId,
 }
 
 impl Scheduler {
-    pub fn new<P>(env: heed::Env, performer: Arc<P>) -> Result<Arc<RwLock<Self>>>
+    pub fn new<P>(store: TaskStore, performer: Arc<P>) -> Result<Arc<RwLock<Self>>>
     where
         P: TaskPerformer,
     {
-        let store = TaskStore::new(env)?;
         let this = Self {
             pending_queue: PendingQueue::default(),
             store,
             processing: Vec::new(),
+            last_fetched_task_id: 0,
         };
 
         let this = Arc::new(RwLock::new(this));
@@ -219,17 +209,9 @@ impl Scheduler {
         Ok(this)
     }
 
-    pub async fn register_task(
-        &mut self,
-        index_uid: IndexUid,
-        content: TaskContent,
-    ) -> Result<Task> {
-        let task = self.store.register(index_uid, content).await?;
-
+    fn register_task(&mut self, task: Task) {
         let pending = Pending::Task(task.clone());
         self.pending_queue.register(pending);
-
-        Ok(task)
     }
 
     /// Clears the processing list, this method should be called when the processing of a batch is
@@ -271,8 +253,26 @@ impl Scheduler {
         self.pending_queue.register(pending);
     }
 
+    async fn fetch_pending_tasks(&mut self) -> Result<()> {
+        self.store
+            .list_tasks(Some(self.last_fetched_task_id + 1), None, None)
+            .await?
+            .into_iter()
+            // the tasks arrive in reverse order, and we need to insert them in order.
+            .rev()
+            .for_each(|t| {
+                self.last_fetched_task_id = t.id;
+                self.register_task(t);
+            });
+
+        Ok(())
+    }
+
     /// Prepares the next batch, and set `processing` to the ids in that batch.
     pub async fn prepare_batch(&mut self) -> Result<Option<Batch>> {
+        // try to fill the queue with pending tasks.
+        self.fetch_pending_tasks().await?;
+
         self.processing.clear();
         if let Some(Pending::Job(job)) = self.pending_queue.jobs.pop_back() {
             Ok(Some(Batch {

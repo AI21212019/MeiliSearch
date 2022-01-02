@@ -57,16 +57,6 @@ pub enum Pending<T> {
     Job(Job),
 }
 
-impl Pending<TaskId> {
-    /// Makes a copy of the task or take the content of the volatile job.
-    pub(crate) fn take(&mut self) -> Self {
-        match self {
-            Self::Task(id) => Self::Task(*id),
-            Self::Job(job) => Self::Job(job.take()),
-        }
-    }
-}
-
 impl Eq for Pending<TaskId> {}
 
 impl PartialOrd for Pending<TaskId> {
