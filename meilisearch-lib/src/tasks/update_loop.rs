@@ -1,9 +1,14 @@
+use std::future::ready;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use chrono::Utc;
+use futures::{pin_mut, Future};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
+use tokio::time::interval_at;
 
 use super::batch::Batch;
 use super::error::Result;
@@ -19,8 +24,8 @@ pub struct UpdateLoop<P: TaskPerformer> {
     scheduler: Arc<RwLock<Scheduler>>,
     performer: Arc<P>,
 
-    /// The interval at which the the `TaskStore` should be checked for new updates
-    task_store_check_interval: Duration,
+    notifier: Option<watch::Receiver<()>>,
+    debounce_duration: Option<Duration>,
 }
 
 impl<P> UpdateLoop<P>
@@ -31,53 +36,75 @@ where
     pub fn new(
         scheduler: Arc<RwLock<Scheduler>>,
         performer: Arc<P>,
-        task_store_check_interval: Duration,
+        debuf_duration: Option<Duration>,
+        notifier: watch::Receiver<()>,
     ) -> Self {
         Self {
             scheduler,
             performer,
-            task_store_check_interval,
+            debounce_duration: debuf_duration,
+            notifier: Some(notifier),
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(mut self) {
+        let mut timer = WaitOrNever::never();
+        let mut notifier = self.notifier.take().unwrap();
+
         loop {
-            if let Err(e) = self.process_next_batch().await {
-                log::error!("an error occured while processing an update batch: {}", e);
+            let notified = notifier.changed();
+            pin_mut!(notified);
+
+            dbg!();
+            tokio::select! {
+                _ = notified => {
+                    // we have been notified that a new update had been, we can start to debuf, and
+                    // see if we receive any more.
+
+                    if let WaitOrNever::Never = timer {
+                        // we are not currently debuffing, we can add a timer
+                        timer = match self.debounce_duration {
+                            Some(t) => WaitOrNever::wait(t),
+                            None => WaitOrNever::now(),
+                        };
+                    }
+                }
+                 _ = &mut timer => {
+                     // debounce time is elapsed, we can process the batch now
+                    timer = WaitOrNever::never();
+
+                    if let Err(e) = self.process_next_batch().await {
+                        log::error!("an error occured while processing an update batch: {}", e);
+                    }
+                }
             }
         }
     }
 
     async fn process_next_batch(&self) -> Result<()> {
         let batch = { self.scheduler.write().await.prepare_batch().await? };
-        match batch {
-            Some(mut batch) => {
-                for task in &mut batch.tasks {
-                    match task {
-                        Pending::Task(task) => task.events.push(TaskEvent::Processing(Utc::now())),
-                        Pending::Job(_) => (),
-                    }
+        if let Some(mut batch) = batch {
+            for task in &mut batch.tasks {
+                match task {
+                    Pending::Task(task) => task.events.push(TaskEvent::Processing(Utc::now())),
+                    Pending::Job(_) => (),
                 }
-
-                // the jobs are ignored
-                batch.tasks = {
-                    self.scheduler
-                        .read()
-                        .await
-                        .update_tasks(batch.tasks)
-                        .await?
-                };
-
-                let performer = self.performer.clone();
-
-                let batch_result = performer.process(batch).await;
-
-                self.handle_batch_result(batch_result).await?;
             }
-            None => {
-                // No update found to create a batch we wait a bit before we retry.
-                tokio::time::sleep(self.task_store_check_interval).await;
-            }
+
+            // the jobs are ignored
+            batch.tasks = {
+                self.scheduler
+                    .read()
+                    .await
+                    .update_tasks(batch.tasks)
+                    .await?
+            };
+
+            let performer = self.performer.clone();
+
+            let batch_result = performer.process(batch).await;
+
+            self.handle_batch_result(batch_result).await?;
         }
 
         Ok(())
@@ -96,6 +123,41 @@ where
         batch.tasks = tasks;
         self.performer.finish(&batch).await;
         Ok(())
+    }
+}
+
+enum WaitOrNever {
+    Wait(Pin<Box<dyn Future<Output = ()>>>),
+    Never,
+}
+
+impl WaitOrNever {
+    fn never() -> Self {
+        Self::Never
+    }
+
+    fn wait(t: Duration) -> Self {
+        let interval = async move {
+            let mut interval = interval_at(tokio::time::Instant::now() + t, t);
+            interval.tick().await;
+        };
+
+        Self::Wait(Box::pin(interval))
+    }
+
+    fn now() -> Self {
+        Self::Wait(Box::pin(ready(())))
+    }
+}
+
+impl Future for WaitOrNever {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match *self {
+            WaitOrNever::Wait(ref mut fut) => fut.as_mut().poll(cx),
+            WaitOrNever::Never => Poll::Pending,
+        }
     }
 }
 

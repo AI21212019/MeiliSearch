@@ -55,6 +55,13 @@ pub struct SchedulerConfig {
     // more updates that what is specified.
     #[structopt(long, hidden = true)]
     pub max_documents_per_batch: Option<usize>,
+
+    /// Debounce duration in seconds
+    ///
+    /// When a new task in enqueud, the scheduler waits `debounce_duration_sec` for new updates before
+    /// starting to process the batch.
+    #[structopt(long, hidden = true)]
+    pub debounce_duration_sec: Option<u64>,
 }
 
 impl TryFrom<&IndexerOpts> for IndexerConfig {

@@ -9,7 +9,7 @@ use std::{
 use atomic_refcell::AtomicRefCell;
 use chrono::Utc;
 use milli::update::IndexDocumentsMethod;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 
 use crate::options::SchedulerConfig;
 
@@ -214,6 +214,8 @@ pub struct Scheduler {
     processing: Vec<TaskId>,
     last_fetched_task_id: TaskId,
     config: SchedulerConfig,
+    /// notify the update loop that a new task was received
+    notifier: watch::Sender<()>,
 }
 
 impl Scheduler {
@@ -225,18 +227,27 @@ impl Scheduler {
     where
         P: TaskPerformer,
     {
+        let (notifier, rcv) = watch::channel(());
+
+        let debounce_time = config.debounce_duration_sec;
+
         let this = Self {
             pending_queue: PendingQueue::default(),
             store,
             processing: Vec::new(),
             last_fetched_task_id: 0,
             config,
+            notifier,
         };
 
         let this = Arc::new(RwLock::new(this));
 
-        // TODO(marin): make the scheduling interval a setting
-        let update_loop = UpdateLoop::new(this.clone(), performer, Duration::from_millis(1000));
+        let update_loop = UpdateLoop::new(
+            this.clone(),
+            performer,
+            debounce_time.filter(|&v| v > 0).map(Duration::from_secs),
+            rcv,
+        );
 
         tokio::task::spawn_local(update_loop.run());
 
@@ -253,6 +264,10 @@ impl Scheduler {
     /// finished.
     pub fn finish(&mut self) {
         self.processing.clear();
+    }
+
+    pub fn notify(&self) {
+        let _ = self.notifier.send(());
     }
 
     pub async fn update_tasks(&self, tasks: Vec<Pending<Task>>) -> Result<Vec<Pending<Task>>> {
@@ -322,6 +337,9 @@ impl Scheduler {
             }))
         } else {
             make_batch(&mut self.pending_queue, &mut self.processing, &self.config);
+
+            log::info!("prepared batch with {} tasks", self.processing.len());
+
             if !self.processing.is_empty() {
                 let ids = std::mem::take(&mut self.processing);
 

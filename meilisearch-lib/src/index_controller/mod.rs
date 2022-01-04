@@ -392,6 +392,7 @@ where
         };
 
         let task = self.task_store.register(uid, content).await?;
+        self.scheduler.read().await.notify();
 
         Ok(task)
     }
