@@ -127,7 +127,7 @@ pub struct Opt {
     #[structopt(skip)]
     pub indexer_options: IndexerOpts,
 
-    #[structopt(flatten, hidden = true)]
+    #[structopt(flatten)]
     pub scheduler_options: SchedulerConfig,
 }
 

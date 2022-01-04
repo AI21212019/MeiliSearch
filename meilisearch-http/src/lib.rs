@@ -74,7 +74,11 @@ pub fn setup_meilisearch(opt: &Opt) -> anyhow::Result<MeiliSearch> {
         meilisearch.set_schedule_snapshot();
     }
 
-    meilisearch.build(opt.db_path.clone(), opt.indexer_options.clone())
+    meilisearch.build(
+        opt.db_path.clone(),
+        opt.indexer_options.clone(),
+        opt.scheduler_options.clone(),
+    )
 }
 
 pub fn configure_data(

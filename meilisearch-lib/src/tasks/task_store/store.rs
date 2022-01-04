@@ -122,7 +122,12 @@ impl Store {
             .map(|limit| (limit as u64).saturating_add(from))
             .unwrap_or(u64::MAX);
         let iter: Box<dyn Iterator<Item = StdResult<_, heed::Error>>> = match filter {
-            Some(filter) => {
+            Some(
+                ref
+                filter @ TaskFilter {
+                    indexes: Some(_), ..
+                },
+            ) => {
                 let iter = self
                     .compute_candidates(txn, filter, range)?
                     .into_iter()
@@ -130,15 +135,24 @@ impl Store {
 
                 Box::new(iter)
             }
-            None => Box::new(
+            _ => Box::new(
                 self.tasks
                     .rev_range(txn, &(BEU64::new(range.start)..BEU64::new(range.end)))?
                     .map(|r| r.map(|(_, t)| t)),
             ),
         };
 
+        let apply_fitler = |task: &StdResult<_, heed::Error>| match task {
+            Ok(ref t) => filter
+                .as_ref()
+                .and_then(|filter| filter.filter_fn.as_ref())
+                .map(|f| f(t))
+                .unwrap_or(true),
+            Err(_) => true,
+        };
         // Collect 'limit' task if it exists or all of them.
         let tasks = iter
+            .filter(apply_fitler)
             .take(limit.unwrap_or(usize::MAX))
             .try_fold::<_, _, StdResult<_, heed::Error>>(Vec::new(), |mut v, task| {
                 v.push(task?);
@@ -151,11 +165,11 @@ impl Store {
     fn compute_candidates(
         &self,
         txn: &heed::RoTxn,
-        filter: TaskFilter,
+        filter: &TaskFilter,
         range: Range<TaskId>,
     ) -> Result<BinaryHeap<TaskId>> {
         let mut candidates = BinaryHeap::new();
-        if let Some(indexes) = filter.indexes {
+        if let Some(ref indexes) = filter.indexes {
             for index in indexes {
                 // We need to prefix search the null terminated string to make sure that we only
                 // get exact matches for the index, and not other uids that would share the same

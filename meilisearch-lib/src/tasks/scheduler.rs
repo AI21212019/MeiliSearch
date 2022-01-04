@@ -244,6 +244,7 @@ impl Scheduler {
     }
 
     fn register_task(&mut self, task: Task) {
+        assert!(!task.is_finished());
         let pending = Pending::Task(task.clone());
         self.pending_queue.register(pending);
     }
@@ -288,8 +289,13 @@ impl Scheduler {
     }
 
     async fn fetch_pending_tasks(&mut self) -> Result<()> {
+        // We must NEVER re-enqueue an already porocessed task! it's content uuid would point to an
+        // an unextisting file.
+        let mut filter = TaskFilter::default();
+        filter.filter_fn(|task| !task.is_finished());
+
         self.store
-            .list_tasks(Some(self.last_fetched_task_id + 1), None, None)
+            .list_tasks(Some(self.last_fetched_task_id), Some(filter), None)
             .await?
             .into_iter()
             // the tasks arrive in reverse order, and we need to insert them in order.
