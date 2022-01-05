@@ -260,13 +260,6 @@ pub mod test {
             Ok(Self::Real(Store::new(env)?))
         }
 
-        pub fn reset_and_return_unfinished_tasks(&mut self) -> Result<BinaryHeap<Pending<TaskId>>> {
-            match self {
-                MockStore::Real(index) => index.reset_and_return_unfinished_tasks(),
-                MockStore::Fake(_) => todo!(),
-            }
-        }
-
         pub fn wtxn(&self) -> Result<RwTxn> {
             match self {
                 MockStore::Real(index) => index.wtxn(),

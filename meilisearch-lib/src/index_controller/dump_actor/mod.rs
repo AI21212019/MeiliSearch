@@ -322,6 +322,8 @@ mod test {
     use crate::index_resolver::error::IndexResolverError;
     use crate::index_resolver::index_store::MockIndexStore;
     use crate::index_resolver::meta_store::MockIndexMetaStore;
+    use crate::options::SchedulerConfig;
+    use crate::tasks::{MockTaskPerformer, TaskStore};
     use crate::update_file_store::UpdateFileStore;
 
     fn setup() {
@@ -371,22 +373,22 @@ mod test {
         let mocker = Mocker::default();
         let update_file_store = UpdateFileStore::mock(mocker);
 
-        //let update_sender =
-        //    create_update_handler(index_resolver.clone(), tmp.path(), 4096 * 100).unwrap();
-
-        //TODO: fix dump tests
+        let performer = Arc::new(MockTaskPerformer::new());
         let mocker = Mocker::default();
-        let task_store = TaskStore::mock(mocker);
+        let store = TaskStore::mock(mocker);
+        let config = SchedulerConfig::default();
+
+        let scheduler = Scheduler::new(store, performer, config).unwrap();
 
         let task = DumpJob {
             dump_path: tmp.path().into(),
             // this should do nothing
             update_file_store,
             db_path: tmp.path().into(),
-            task_store,
             uid: String::from("test"),
             update_db_size: 4096 * 10,
             index_db_size: 4096 * 10,
+            scheduler,
         };
 
         task.run().await.unwrap();
@@ -408,16 +410,19 @@ mod test {
 
         let mocker = Mocker::default();
         let task_store = TaskStore::mock(mocker);
+        let performer = Arc::new(MockTaskPerformer::new());
+
+        let scheduler = Scheduler::new(task_store, performer, SchedulerConfig::default()).unwrap();
 
         let task = DumpJob {
             dump_path: tmp.path().into(),
             // this should do nothing
             db_path: tmp.path().into(),
             update_file_store: file_store,
-            task_store,
             uid: String::from("test"),
             update_db_size: 4096 * 10,
             index_db_size: 4096 * 10,
+            scheduler,
         };
 
         assert!(task.run().await.is_err());

@@ -79,8 +79,8 @@ where
     }
 
     async fn process_next_batch(&self) -> Result<()> {
-        let work = { self.scheduler.write().await.prepare().await? };
-        match work {
+        let pending = { self.scheduler.write().await.prepare().await? };
+        match pending {
             Pending::Batch(mut batch) => {
                 for task in &mut batch.tasks {
                     task.events.push(TaskEvent::Processing(Utc::now()));
@@ -97,7 +97,6 @@ where
 
                 let performer = self.performer.clone();
 
-                tokio::time::sleep(Duration::from_secs(15)).await;
                 let batch = performer.process_batch(batch).await;
 
                 self.handle_batch_result(batch).await?;
@@ -159,140 +158,6 @@ impl Future for WaitOrNever {
         match *self {
             WaitOrNever::Wait(ref mut fut) => fut.as_mut().poll(cx),
             WaitOrNever::Never => Poll::Pending,
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use nelson::Mocker;
-
-    use crate::index_resolver::IndexUid;
-    use crate::tasks::task::Task;
-    use crate::tasks::task_store::TaskFilter;
-
-    use super::super::task::{TaskContent, TaskEvent, TaskId, TaskResult};
-    use super::super::MockTaskPerformer;
-    use super::*;
-
-    #[tokio::test]
-    async fn test_prepare_batch_full() {
-        let mocker = Mocker::default();
-
-        mocker
-            .when::<(TaskId, Option<TaskFilter>), Result<Option<Task>>>("get_task")
-            .once()
-            .then(|(id, _filter)| {
-                let task = Task {
-                    id,
-                    index_uid: IndexUid::new("Test".to_string()).unwrap(),
-                    content: TaskContent::IndexDeletion,
-                    events: vec![TaskEvent::Created(Utc::now())],
-                };
-                Ok(Some(task))
-            });
-
-        mocker
-            .when::<(), Option<Pending<TaskId>>>("peek_pending_task")
-            .then(|()| Some(Pending::Task(1)));
-
-        let store = TaskStore::mock(mocker);
-        let performer = Arc::new(MockTaskPerformer::new());
-
-        let scheduler = UpdateLoop {
-            store,
-            performer,
-            task_store_check_interval: Duration::from_millis(1),
-        };
-
-        let batch = scheduler.prepare_batch().await.unwrap().unwrap();
-
-        assert_eq!(batch.tasks.len(), 1);
-        assert!(
-            matches!(batch.tasks[0], Pending::Task(Task { id: 1, .. })),
-            "{:?}",
-            batch.tasks[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_prepare_batch_empty() {
-        let mocker = Mocker::default();
-        mocker
-            .when::<(), Option<Pending<TaskId>>>("peek_pending_task")
-            .then(|()| None);
-
-        let store = TaskStore::mock(mocker);
-        let performer = Arc::new(MockTaskPerformer::new());
-
-        let scheduler = UpdateLoop {
-            store,
-            performer,
-            task_store_check_interval: Duration::from_millis(1),
-        };
-
-        assert!(scheduler.prepare_batch().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_loop_run_normal() {
-        let mocker = Mocker::default();
-        let mut id = Some(1);
-        mocker
-            .when::<(), Option<Pending<TaskId>>>("peek_pending_task")
-            .then(move |()| id.take().map(Pending::Task));
-        mocker
-            .when::<(TaskId, Option<TaskFilter>), Result<Task>>("get_task")
-            .once()
-            .then(|(id, _)| {
-                let task = Task {
-                    id,
-                    index_uid: IndexUid::new("Test".to_string()).unwrap(),
-                    content: TaskContent::IndexDeletion,
-                    events: vec![TaskEvent::Created(Utc::now())],
-                };
-                Ok(task)
-            });
-
-        mocker
-            .when::<Vec<Pending<Task>>, Result<Vec<Pending<Task>>>>("update_tasks")
-            .times(2)
-            .then(|tasks| {
-                assert_eq!(tasks.len(), 1);
-                Ok(tasks)
-            });
-
-        mocker.when::<(), ()>("delete_pending").once().then(|_| ());
-
-        let store = TaskStore::mock(mocker);
-
-        let mut performer = MockTaskPerformer::new();
-        performer.expect_process().once().returning(|mut batch| {
-            batch.tasks.iter_mut().for_each(|t| match t {
-                Pending::Task(Task { ref mut events, .. }) => events.push(TaskEvent::Succeded {
-                    result: TaskResult::Other,
-                    timestamp: Utc::now(),
-                }),
-                _ => panic!("expected a task, found a job"),
-            });
-
-            batch
-        });
-
-        performer.expect_finish().once().returning(|_| ());
-
-        let performer = Arc::new(performer);
-
-        let scheduler = UpdateLoop {
-            store,
-            performer,
-            task_store_check_interval: Duration::from_millis(1),
-        };
-
-        let handle = tokio::spawn(scheduler.run());
-
-        if let Ok(r) = tokio::time::timeout(Duration::from_millis(100), handle).await {
-            r.unwrap();
         }
     }
 }

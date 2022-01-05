@@ -33,7 +33,6 @@ pub mod test {
 
     use super::error::Result;
     use super::index::Index;
-    use super::update_handler::UpdateHandler;
     use super::{Checked, IndexMeta, IndexStats, SearchQuery, SearchResult, Settings};
     use crate::update_file_store::UpdateFileStore;
 
@@ -52,7 +51,7 @@ pub mod test {
             path: impl AsRef<Path>,
             size: usize,
             uuid: Uuid,
-            update_handler: Arc<UpdateHandler>,
+            update_handler: Arc<IndexerConfig>,
         ) -> Result<Self> {
             let index = Index::open(path, size, uuid, update_handler)?;
             Ok(Self::Real(index))

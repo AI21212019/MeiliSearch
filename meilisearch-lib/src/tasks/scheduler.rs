@@ -187,6 +187,11 @@ impl TaskQueue {
 
         Some(result)
     }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty() && self.index_tasks.is_empty()
+    }
 }
 
 pub struct Scheduler {
@@ -353,6 +358,7 @@ impl Scheduler {
     }
 }
 
+#[derive(Debug)]
 pub enum Pending {
     Batch(Batch),
     Job(Job),
@@ -434,13 +440,13 @@ mod test {
         queue.insert(gen_task(5, "test1", TaskContent::IndexDeletion));
         queue.insert(gen_task(6, "test2", TaskContent::IndexDeletion));
 
-        let mut test1_tasks = queue
+        let test1_tasks = queue
             .head_mut(|tasks| tasks.drain().map(|t| t.id).collect::<Vec<_>>())
             .unwrap();
 
         assert_eq!(test1_tasks, &[0, 4, 5]);
 
-        let mut test2_tasks = queue
+        let test2_tasks = queue
             .head_mut(|tasks| tasks.drain().map(|t| t.id).collect::<Vec<_>>())
             .unwrap();
 
@@ -468,34 +474,30 @@ mod test {
         queue.insert(gen_task(6, "test2", content.clone()));
         queue.insert(gen_task(7, "test1", content.clone()));
 
-        let mut queue = PendingQueue {
-            jobs: Default::default(),
-            tasks: queue,
-        };
-
         let mut batch = Vec::new();
 
-        make_batch(&mut queue, &mut batch);
+        let config = SchedulerConfig::default();
+        make_batch(&mut queue, &mut batch, &config);
         assert_eq!(batch, &[0, 4]);
 
         batch.clear();
-        make_batch(&mut queue, &mut batch);
+        make_batch(&mut queue, &mut batch, &config);
         assert_eq!(batch, &[1]);
 
         batch.clear();
-        make_batch(&mut queue, &mut batch);
+        make_batch(&mut queue, &mut batch, &config);
         assert_eq!(batch, &[2]);
 
         batch.clear();
-        make_batch(&mut queue, &mut batch);
+        make_batch(&mut queue, &mut batch, &config);
         assert_eq!(batch, &[3, 6]);
 
         batch.clear();
-        make_batch(&mut queue, &mut batch);
+        make_batch(&mut queue, &mut batch, &config);
         assert_eq!(batch, &[5]);
 
         batch.clear();
-        make_batch(&mut queue, &mut batch);
+        make_batch(&mut queue, &mut batch, &config);
         assert_eq!(batch, &[7]);
 
         assert!(queue.is_empty());

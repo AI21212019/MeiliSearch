@@ -265,13 +265,6 @@ pub mod test {
             }
         }
 
-        pub async fn delete_pending(&self, to_delete: &Pending<Task>) {
-            match self {
-                Self::Real(s) => s.delete_pending(to_delete).await,
-                Self::Mock(m) => unsafe { m.get("delete_pending").call(to_delete) },
-            }
-        }
-
         pub async fn get_task(&self, id: TaskId, filter: Option<TaskFilter>) -> Result<Task> {
             match self {
                 Self::Real(s) => s.get_task(id, filter).await,
@@ -279,23 +272,13 @@ pub mod test {
             }
         }
 
-        pub async fn get_processing_task(&self) -> Result<Option<Task>> {
+        pub async fn get_pending_tasks(
+            &self,
+            tasks: Vec<TaskId>,
+        ) -> Result<(Vec<TaskId>, Vec<Task>)> {
             match self {
-                Self::Real(s) => s.get_processing_task().await,
-                Self::Mock(m) => unsafe {
-                    m.get::<_, Result<Option<Task>>>("get_pending_task")
-                        .call(())
-                },
-            }
-        }
-
-        pub async fn peek_pending_task(&self) -> Option<Pending<TaskId>> {
-            match self {
-                Self::Real(s) => s.peek_pending_task().await,
-                Self::Mock(m) => unsafe {
-                    m.get::<_, Option<Pending<TaskId>>>("peek_pending_task")
-                        .call(())
-                },
+                Self::Real(s) => s.get_pending_tasks(tasks).await,
+                Self::Mock(m) => unsafe { m.get("peek_pending_task").call(tasks) },
             }
         }
 
@@ -328,13 +311,6 @@ pub mod test {
         pub fn register_raw_update(&self, wtxn: &mut RwTxn, task: &Task) -> Result<()> {
             match self {
                 Self::Real(s) => s.register_raw_update(wtxn, task),
-                Self::Mock(_m) => todo!(),
-            }
-        }
-
-        pub async fn register_job(&self, content: Job) {
-            match self {
-                Self::Real(s) => s.register_job(content).await,
                 Self::Mock(_m) => todo!(),
             }
         }

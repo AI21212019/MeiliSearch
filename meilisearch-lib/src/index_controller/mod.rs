@@ -631,16 +631,18 @@ mod test {
 
     impl IndexController<MockIndexMetaStore, MockIndexStore> {
         pub fn mock(
-            index_resolver: IndexResolver<MockIndexMetaStore, MockIndexStore>,
+            index_resolver: Arc<IndexResolver<MockIndexMetaStore, MockIndexStore>>,
             task_store: TaskStore,
             update_file_store: UpdateFileStore,
             dump_handle: DumpActorHandleImpl,
+            scheduler: Arc<RwLock<Scheduler>>,
         ) -> Self {
             IndexController {
-                index_resolver: Arc::new(index_resolver),
+                index_resolver,
                 task_store,
                 dump_handle,
                 update_file_store,
+                scheduler,
             }
         }
     }
@@ -713,13 +715,27 @@ mod test {
         let task_store_mocker = nelson::Mocker::default();
         let mocker = Mocker::default();
         let update_file_store = UpdateFileStore::mock(mocker);
-        let index_resolver = IndexResolver::new(uuid_store, index_store, update_file_store.clone());
+        let index_resolver = Arc::new(IndexResolver::new(
+            uuid_store,
+            index_store,
+            update_file_store.clone(),
+        ));
         let task_store = TaskStore::mock(task_store_mocker);
-        // let dump_actor = MockDumpActorHandle::new();
+        let scheduler = Scheduler::new(
+            task_store.clone(),
+            index_resolver.clone(),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
         let (sender, _) = mpsc::channel(1);
         let dump_handle = DumpActorHandleImpl { sender };
-        let index_controller =
-            IndexController::mock(index_resolver, task_store, update_file_store, dump_handle);
+        let index_controller = IndexController::mock(
+            index_resolver,
+            task_store,
+            update_file_store,
+            dump_handle,
+            scheduler,
+        );
 
         let r = index_controller
             .search(index_uid.to_owned(), query.clone())

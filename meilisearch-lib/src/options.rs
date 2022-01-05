@@ -43,7 +43,7 @@ pub struct IndexerOpts {
     pub indexing_jobs: Option<usize>,
 }
 
-#[derive(Debug, Clone, StructOpt)]
+#[derive(Debug, Clone, StructOpt, Default)]
 pub struct SchedulerConfig {
     // The maximum number of updates that can be batched together. If None, this is unlimited. A
     // value of 0 is interpreted as 1.
