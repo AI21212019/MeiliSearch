@@ -226,14 +226,33 @@ pub fn load_dump(
             indexer_opts,
         )?,
     }
+    println!("Dump was imported in temp directory");
     // Persist and atomically rename the db
     let persisted_dump = tmp_dst.into_path();
     if dst_path.as_ref().exists() {
         warn!("Overwriting database at {}", dst_path.as_ref().display());
-        std::fs::remove_dir_all(&dst_path)?;
+        for file in dst_path.as_ref().read_dir().unwrap() {
+            let file = file.unwrap().path();
+
+            println!("deleting {:?}", file);
+
+            if file.is_file() {
+                std::fs::remove_file(&file)?;
+            } else {
+                std::fs::remove_dir_all(&file)?;
+            }
+        }
     }
 
-    std::fs::rename(&persisted_dump, &dst_path)?;
+    println!("Right before overwriting the data.ms with the dump");
+
+    for file in persisted_dump.read_dir().unwrap() {
+        let file = file.unwrap().path();
+
+        std::fs::rename(&file, &dst_path.as_ref().join(file.file_name().unwrap()))?;
+    }
+
+    println!("Right after overwriting the data.ms with the dump");
 
     Ok(())
 }
