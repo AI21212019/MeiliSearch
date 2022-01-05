@@ -4,6 +4,7 @@ pub mod meta_store;
 
 use std::convert::{TryFrom, TryInto};
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::Utc;
 use error::{IndexResolverError, Result};
@@ -36,7 +37,7 @@ pub fn create_index_resolver(
     path: impl AsRef<Path>,
     index_size: usize,
     indexer_opts: &IndexerOpts,
-    meta_env: heed::Env,
+    meta_env: Arc<heed::Env>,
     file_store: UpdateFileStore,
 ) -> anyhow::Result<HardStateIndexResolver> {
     let uuid_store = HeedMetaStore::new(meta_env)?;
@@ -160,7 +161,7 @@ impl IndexResolver<HeedMetaStore, MapIndexStore> {
         src: impl AsRef<Path>,
         dst: impl AsRef<Path>,
         index_db_size: usize,
-        env: Env,
+        env: Arc<Env>,
         indexer_opts: &IndexerOpts,
     ) -> anyhow::Result<()> {
         HeedMetaStore::load_dump(&src, env)?;
