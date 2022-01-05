@@ -6,13 +6,12 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::{pin_mut, Future};
-use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, RwLock};
 use tokio::time::interval_at;
 
 use super::batch::Batch;
 use super::error::Result;
-use super::task_store::Pending;
+use super::scheduler::Pending;
 use super::{Scheduler, TaskPerformer};
 use crate::tasks::task::TaskEvent;
 
@@ -31,7 +30,6 @@ pub struct UpdateLoop<P: TaskPerformer> {
 impl<P> UpdateLoop<P>
 where
     P: TaskPerformer + Send + Sync + 'static,
-    P::Error: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
 {
     pub fn new(
         scheduler: Arc<RwLock<Scheduler>>,
@@ -55,7 +53,6 @@ where
             let notified = notifier.changed();
             pin_mut!(notified);
 
-            dbg!();
             tokio::select! {
                 _ = notified => {
                     // we have been notified that a new update had been, we can start to debuf, and
@@ -82,29 +79,34 @@ where
     }
 
     async fn process_next_batch(&self) -> Result<()> {
-        let batch = { self.scheduler.write().await.prepare_batch().await? };
-        if let Some(mut batch) = batch {
-            for task in &mut batch.tasks {
-                match task {
-                    Pending::Task(task) => task.events.push(TaskEvent::Processing(Utc::now())),
-                    Pending::Job(_) => (),
+        let work = { self.scheduler.write().await.prepare().await? };
+        match work {
+            Pending::Batch(mut batch) => {
+                for task in &mut batch.tasks {
+                    task.events.push(TaskEvent::Processing(Utc::now()));
                 }
+
+                // the jobs are ignored
+                batch.tasks = {
+                    self.scheduler
+                        .read()
+                        .await
+                        .update_tasks(batch.tasks)
+                        .await?
+                };
+
+                let performer = self.performer.clone();
+
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let batch = performer.process_batch(batch).await;
+
+                self.handle_batch_result(batch).await?;
             }
-
-            // the jobs are ignored
-            batch.tasks = {
-                self.scheduler
-                    .read()
-                    .await
-                    .update_tasks(batch.tasks)
-                    .await?
-            };
-
-            let performer = self.performer.clone();
-
-            let batch_result = performer.process(batch).await;
-
-            self.handle_batch_result(batch_result).await?;
+            Pending::Job(job) => {
+                let performer = self.performer.clone();
+                performer.process_job(job).await;
+            }
+            Pending::Nothing => (),
         }
 
         Ok(())

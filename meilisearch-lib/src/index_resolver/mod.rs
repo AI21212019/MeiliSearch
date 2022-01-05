@@ -9,7 +9,6 @@ use chrono::Utc;
 use error::{IndexResolverError, Result};
 use heed::Env;
 use index_store::{IndexStore, MapIndexStore};
-use meilisearch_error::ResponseError;
 use meta_store::{HeedMetaStore, IndexMetaStore};
 use milli::update::{DocumentDeletionResult, IndexerConfig};
 use serde::{Deserialize, Serialize};
@@ -20,7 +19,6 @@ use crate::index::{error::Result as IndexResult, Index};
 use crate::options::IndexerOpts;
 use crate::tasks::batch::Batch;
 use crate::tasks::task::{DocumentDeletion, Job, Task, TaskContent, TaskEvent, TaskId, TaskResult};
-use crate::tasks::Pending;
 use crate::tasks::TaskPerformer;
 use crate::update_file_store::UpdateFileStore;
 
@@ -96,27 +94,25 @@ where
     U: IndexMetaStore + Send + Sync + 'static,
     I: IndexStore + Send + Sync + 'static,
 {
-    type Error = ResponseError;
-
-    async fn process(&self, mut batch: Batch) -> Batch {
+    async fn process_batch(&self, mut batch: Batch) -> Batch {
         // If a batch contains multiple tasks, then it must be a document addition batch
-        if let Some(Pending::Task(Task {
+        if let Some(Task {
             content: TaskContent::DocumentAddition { .. },
             ..
-        })) = batch.tasks.first()
+        }) = batch.tasks.first()
         {
             debug_assert!(batch.tasks.iter().all(|t| matches!(
                 t,
-                Pending::Task(Task {
+                Task {
                     content: TaskContent::DocumentAddition { .. },
                     ..
-                })
+                }
             )));
 
             self.process_document_addition_batch(batch).await
         } else {
             match batch.tasks.first_mut() {
-                Some(Pending::Task(task)) => {
+                Some(task) => {
                     task.events.push(TaskEvent::Processing(Utc::now()));
 
                     match self.process_task(task).await {
@@ -132,15 +128,14 @@ where
                         }),
                     }
                 }
-                Some(Pending::Job(job)) => {
-                    let job = std::mem::take(job);
-                    self.process_job(job).await;
-                }
-
                 None => (),
             }
             batch
         }
+    }
+
+    async fn process_job(&self, job: Job) {
+        self.process_job(job).await;
     }
 
     async fn finish(&self, batch: &Batch) {
@@ -194,12 +189,12 @@ where
     }
 
     async fn process_document_addition_batch(&self, mut batch: Batch) -> Batch {
-        fn get_content_uuid(task: &Pending<Task>) -> Uuid {
+        fn get_content_uuid(task: &Task) -> Uuid {
             match task {
-                Pending::Task(Task {
+                Task {
                     content: TaskContent::DocumentAddition { content_uuid, .. },
                     ..
-                }) => *content_uuid,
+                } => *content_uuid,
                 _ => panic!("unexpected task in the document addition batch"),
             }
         }
@@ -207,7 +202,7 @@ where
         let content_uuids = batch.tasks.iter().map(get_content_uuid).collect::<Vec<_>>();
 
         match batch.tasks.first() {
-            Some(Pending::Task(Task {
+            Some(Task {
                 index_uid,
                 id,
                 content:
@@ -217,7 +212,7 @@ where
                         ..
                     },
                 ..
-            })) => {
+            }) => {
                 let primary_key = primary_key.clone();
                 let method = *merge_strategy;
 
@@ -254,12 +249,7 @@ where
                 };
 
                 for task in batch.tasks.iter_mut() {
-                    match task {
-                        Pending::Task(Task { ref mut events, .. }) => {
-                            events.push(event.clone());
-                        }
-                        _ => panic!("unexpected task"),
-                    }
+                    task.events.push(event.clone());
                 }
 
                 batch

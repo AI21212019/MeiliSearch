@@ -18,7 +18,7 @@ use super::{
     error::Result,
     task::{Job, Task, TaskContent, TaskEvent, TaskId},
     update_loop::UpdateLoop,
-    Pending, TaskFilter, TaskPerformer, TaskStore,
+    TaskFilter, TaskPerformer, TaskStore,
 };
 
 #[derive(Eq, Debug, Clone, Copy)]
@@ -189,27 +189,10 @@ impl TaskQueue {
     }
 }
 
-#[derive(Default)]
-struct PendingQueue {
-    jobs: VecDeque<Pending<TaskId>>,
-    tasks: TaskQueue,
-}
-
-impl PendingQueue {
-    fn register(&mut self, pending: Pending<Task>) {
-        match pending {
-            Pending::Task(t) => {
-                self.tasks.insert(t);
-            }
-            Pending::Job(j) => {
-                self.jobs.push_front(Pending::Job(j));
-            }
-        }
-    }
-}
-
 pub struct Scheduler {
-    pending_queue: PendingQueue,
+    jobs: VecDeque<Job>,
+    tasks: TaskQueue,
+
     store: TaskStore,
     processing: Vec<TaskId>,
     last_fetched_task_id: TaskId,
@@ -232,7 +215,9 @@ impl Scheduler {
         let debounce_time = config.debounce_duration_sec;
 
         let this = Self {
-            pending_queue: PendingQueue::default(),
+            jobs: VecDeque::new(),
+            tasks: TaskQueue::default(),
+
             store,
             processing: Vec::new(),
             last_fetched_task_id: 0,
@@ -256,8 +241,7 @@ impl Scheduler {
 
     fn register_task(&mut self, task: Task) {
         assert!(!task.is_finished());
-        let pending = Pending::Task(task.clone());
-        self.pending_queue.register(pending);
+        self.tasks.insert(task);
     }
 
     /// Clears the processing list, this method should be called when the processing of a batch is
@@ -270,7 +254,7 @@ impl Scheduler {
         let _ = self.notifier.send(());
     }
 
-    pub async fn update_tasks(&self, tasks: Vec<Pending<Task>>) -> Result<Vec<Pending<Task>>> {
+    pub async fn update_tasks(&self, tasks: Vec<Task>) -> Result<Vec<Task>> {
         self.store.update_tasks(tasks).await
     }
 
@@ -299,8 +283,7 @@ impl Scheduler {
     }
 
     pub async fn schedule_job(&mut self, job: Job) {
-        let pending = Pending::Job(job);
-        self.pending_queue.register(pending);
+        self.jobs.push_back(job);
     }
 
     async fn fetch_pending_tasks(&mut self) -> Result<()> {
@@ -324,109 +307,102 @@ impl Scheduler {
     }
 
     /// Prepares the next batch, and set `processing` to the ids in that batch.
-    pub async fn prepare_batch(&mut self) -> Result<Option<Batch>> {
+    pub async fn prepare(&mut self) -> Result<Pending> {
+        // If there is a job to process, do it first.
+        if let Some(job) = self.jobs.pop_front() {
+            return Ok(Pending::Job(job));
+        }
         // try to fill the queue with pending tasks.
         self.fetch_pending_tasks().await?;
 
         self.processing.clear();
-        if let Some(Pending::Job(job)) = self.pending_queue.jobs.pop_back() {
-            Ok(Some(Batch {
-                id: 0,
+        make_batch(&mut self.tasks, &mut self.processing, &self.config);
+
+        log::debug!("prepared batch with {} tasks", self.processing.len());
+
+        if !self.processing.is_empty() {
+            let ids = std::mem::take(&mut self.processing);
+
+            let (ids, mut tasks) = self.store.get_pending_tasks(ids).await?;
+
+            // The batch id is the id of the first update it contains
+            let id = match tasks.first() {
+                Some(Task { id, .. }) => *id,
+                _ => panic!("invalid batch"),
+            };
+
+            tasks.iter_mut().for_each(|t| {
+                t.events.push(TaskEvent::Batched {
+                    batch_id: id,
+                    timestamp: Utc::now(),
+                })
+            });
+
+            self.processing = ids;
+
+            let batch = Batch {
+                id,
                 created_at: Utc::now(),
-                tasks: vec![Pending::Job(job)],
-            }))
+                tasks,
+            };
+
+            Ok(Pending::Batch(batch))
         } else {
-            make_batch(&mut self.pending_queue, &mut self.processing, &self.config);
-
-            log::info!("prepared batch with {} tasks", self.processing.len());
-
-            if !self.processing.is_empty() {
-                let ids = std::mem::take(&mut self.processing);
-
-                let (ids, mut tasks) = self.store.get_pending_tasks(ids).await?;
-
-                // The batch id is the id of the first update it contains
-                let id = match tasks.first() {
-                    Some(Pending::Task(Task { id, .. })) => *id,
-                    _ => panic!("invalid batch"),
-                };
-
-                tasks.iter_mut().for_each(|t| {
-                    if let Pending::Task(Task { ref mut events, .. }) = t {
-                        events.push(TaskEvent::Batched {
-                            batch_id: id,
-                            timestamp: Utc::now(),
-                        })
-                    }
-                });
-
-                self.processing = ids;
-
-                let batch = Batch {
-                    id,
-                    created_at: Utc::now(),
-                    tasks,
-                };
-
-                Ok(Some(batch))
-            } else {
-                Ok(None)
-            }
+            Ok(Pending::Nothing)
         }
     }
 }
 
-fn make_batch(
-    pending_queue: &mut PendingQueue,
-    processing: &mut Vec<TaskId>,
-    config: &SchedulerConfig,
-) {
+pub enum Pending {
+    Batch(Batch),
+    Job(Job),
+    Nothing,
+}
+
+fn make_batch(tasks: &mut TaskQueue, processing: &mut Vec<TaskId>, config: &SchedulerConfig) {
     // the processing list MUST be empty when it is handed to us.
     assert!(processing.is_empty());
 
     let mut doc_count = 0;
-    pending_queue
-        .tasks
-        .head_mut(|list| match list.peek().copied() {
-            Some(PendingTask {
-                kind: TaskType::Other,
-                id,
-            }) => {
-                processing.push(id);
-                list.pop();
-            }
-            Some(PendingTask { kind, .. }) => loop {
-                match list.peek() {
-                    Some(pending) if pending.kind == kind => match config.max_batch_size {
-                        Some(limit) if processing.len() >= limit.max(1) => break,
-                        _ => {
-                            let pending = list.pop().unwrap();
-                            processing.push(pending.id);
+    tasks.head_mut(|list| match list.peek().copied() {
+        Some(PendingTask {
+            kind: TaskType::Other,
+            id,
+        }) => {
+            processing.push(id);
+            list.pop();
+        }
+        Some(PendingTask { kind, .. }) => loop {
+            match list.peek() {
+                Some(pending) if pending.kind == kind => match config.max_batch_size {
+                    Some(limit) if processing.len() >= limit.max(1) => break,
+                    _ => {
+                        let pending = list.pop().unwrap();
+                        processing.push(pending.id);
 
-                            // add the number of documents to count if we are scheduling document additions and
-                            // stop adding if we already have enough. We check that bound only
-                            // after adding the task to the batch, so a single update is always
-                            // processed even if it has to any documents in it.
-                            match pending.kind {
-                                TaskType::DocumentsUpdate { number }
-                                | TaskType::DocumentAddition { number } => {
-                                    doc_count += number;
+                        // add the number of documents to count if we are scheduling document additions and
+                        // stop adding if we already have enough. We check that bound only
+                        // after adding the task to the batch, so a single update is always
+                        // processed even if it has to any documents in it.
+                        match pending.kind {
+                            TaskType::DocumentsUpdate { number }
+                            | TaskType::DocumentAddition { number } => {
+                                doc_count += number;
 
-                                    if doc_count
-                                        >= config.max_documents_per_batch.unwrap_or(usize::MAX)
-                                    {
-                                        break;
-                                    }
+                                if doc_count >= config.max_documents_per_batch.unwrap_or(usize::MAX)
+                                {
+                                    break;
                                 }
-                                _ => (),
                             }
+                            _ => (),
                         }
-                    },
-                    _ => break,
-                }
-            },
-            None => (),
-        });
+                    }
+                },
+                _ => break,
+            }
+        },
+        None => (),
+    });
 }
 
 #[cfg(test)]

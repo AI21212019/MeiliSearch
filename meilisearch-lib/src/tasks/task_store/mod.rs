@@ -1,6 +1,5 @@
 mod store;
 
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -9,10 +8,9 @@ use std::sync::Arc;
 use chrono::Utc;
 use heed::{Env, RwTxn};
 use log::debug;
-use uuid::Uuid;
 
 use super::error::TaskError;
-use super::task::{Job, Task, TaskContent, TaskId};
+use super::task::{Task, TaskContent, TaskId};
 use super::Result;
 use crate::index_resolver::IndexUid;
 use crate::tasks::task::TaskEvent;
@@ -47,49 +45,6 @@ impl TaskFilter {
 
     pub fn filter_fn(&mut self, f: impl Fn(&Task) -> bool + Sync + Send + 'static) {
         self.filter_fn.replace(Box::new(f));
-    }
-}
-
-/// You can't clone a job because of its volatile nature.
-/// If you need to take the `Job` with you though. You can call the method
-/// `Pending::take`. It'll return the `Pending` as-is but `Empty` the original.
-#[derive(Debug, PartialEq)]
-pub enum Pending<T> {
-    /// A task stored on disk that must be processed.
-    Task(T),
-    /// Job always have a higher priority over normal tasks and are not stored on disk.
-    /// It can be refered as `Volatile job`.
-    Job(Job),
-}
-
-impl Eq for Pending<TaskId> {}
-
-impl PartialOrd for Pending<TaskId> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match (self, other) {
-            // in case of two tasks we want to return the lowest taskId first.
-            (Pending::Task(lhs), Pending::Task(rhs)) => Some(lhs.cmp(rhs).reverse()),
-            // A job is always better than a task.
-            (Pending::Task(_), Pending::Job(_)) => Some(Ordering::Less),
-            (Pending::Job(_), Pending::Task(_)) => Some(Ordering::Greater),
-            // When there is two jobs we consider them equals.
-            (Pending::Job(_), Pending::Job(_)) => Some(Ordering::Equal),
-        }
-    }
-}
-
-impl Pending<Task> {
-    pub fn get_content_uuid(&self) -> Option<Uuid> {
-        match self {
-            Pending::Task(task) => task.get_content_uuid(),
-            _ => None,
-        }
-    }
-}
-
-impl Ord for Pending<TaskId> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
     }
 }
 
@@ -159,21 +114,16 @@ impl TaskStore {
         }
     }
 
-    pub async fn get_pending_tasks(
-        &self,
-        ids: Vec<TaskId>,
-    ) -> Result<(Vec<TaskId>, Vec<Pending<Task>>)> {
+    pub async fn get_pending_tasks(&self, ids: Vec<TaskId>) -> Result<(Vec<TaskId>, Vec<Task>)> {
         let store = self.store.clone();
         let tasks = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut tasks = Vec::new();
             let txn = store.rtxn()?;
 
             for id in ids.iter() {
-                let task = Pending::Task(
-                    store
-                        .get(&txn, *id)?
-                        .ok_or(TaskError::UnexistingTask(*id))?,
-                );
+                let task = store
+                    .get(&txn, *id)?
+                    .ok_or(TaskError::UnexistingTask(*id))?;
                 tasks.push(task);
             }
             Ok((ids, tasks))
@@ -183,17 +133,14 @@ impl TaskStore {
         Ok(tasks)
     }
 
-    pub async fn update_tasks(&self, tasks: Vec<Pending<Task>>) -> Result<Vec<Pending<Task>>> {
+    pub async fn update_tasks(&self, tasks: Vec<Task>) -> Result<Vec<Task>> {
         let store = self.store.clone();
 
         let tasks = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut txn = store.wtxn()?;
 
             for task in &tasks {
-                match task {
-                    Pending::Task(task) => store.put(&mut txn, task)?,
-                    Pending::Job(_) => (),
-                }
+                store.put(&mut txn, task)?;
             }
 
             txn.commit()?;
@@ -309,12 +256,11 @@ pub mod test {
             Self::Mock(Arc::new(mocker))
         }
 
-        pub async fn update_tasks(&self, tasks: Vec<Pending<Task>>) -> Result<Vec<Pending<Task>>> {
+        pub async fn update_tasks(&self, tasks: Vec<Task>) -> Result<Vec<Task>> {
             match self {
                 Self::Real(s) => s.update_tasks(tasks).await,
                 Self::Mock(m) => unsafe {
-                    m.get::<_, Result<Vec<Pending<Task>>>>("update_tasks")
-                        .call(tasks)
+                    m.get::<_, Result<Vec<Task>>>("update_tasks").call(tasks)
                 },
             }
         }
