@@ -123,7 +123,7 @@ pub fn default_settings(dir: impl AsRef<Path>) -> Opt {
         },
         log_level: "off".into(),
         scheduler_options: meilisearch_lib::options::SchedulerConfig {
-            max_batch_size: Some(1),
+            max_batch_size: 1,
             max_documents_per_batch: None,
             debounce_duration_sec: None,
         },

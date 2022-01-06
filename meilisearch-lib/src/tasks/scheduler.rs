@@ -188,7 +188,6 @@ impl TaskQueue {
         Some(result)
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty() && self.index_tasks.is_empty()
     }
@@ -200,7 +199,7 @@ pub struct Scheduler {
 
     store: TaskStore,
     processing: Vec<TaskId>,
-    last_fetched_task_id: TaskId,
+    next_fetched_task_id: TaskId,
     config: SchedulerConfig,
     /// notify the update loop that a new task was received
     notifier: watch::Sender<()>,
@@ -225,7 +224,7 @@ impl Scheduler {
 
             store,
             processing: Vec::new(),
-            last_fetched_task_id: 0,
+            next_fetched_task_id: 0,
             config,
             notifier,
         };
@@ -257,6 +256,12 @@ impl Scheduler {
 
     pub fn notify(&self) {
         let _ = self.notifier.send(());
+    }
+
+    fn notifiy_if_not_empty(&self) {
+        if !!self.jobs.is_empty() || !self.tasks.is_empty() {
+            self.notify();
+        }
     }
 
     pub async fn update_tasks(&self, tasks: Vec<Task>) -> Result<Vec<Task>> {
@@ -298,13 +303,13 @@ impl Scheduler {
         filter.filter_fn(|task| !task.is_finished());
 
         self.store
-            .list_tasks(Some(self.last_fetched_task_id), Some(filter), None)
+            .list_tasks(Some(self.next_fetched_task_id), Some(filter), None)
             .await?
             .into_iter()
             // the tasks arrive in reverse order, and we need to insert them in order.
             .rev()
             .for_each(|t| {
-                self.last_fetched_task_id = t.id;
+                self.next_fetched_task_id = t.id + 1;
                 self.register_task(t);
             });
 
@@ -315,6 +320,8 @@ impl Scheduler {
     pub async fn prepare(&mut self) -> Result<Pending> {
         // If there is a job to process, do it first.
         if let Some(job) = self.jobs.pop_front() {
+            // There is more work to do, notify the update loop
+            self.notifiy_if_not_empty();
             return Ok(Pending::Job(job));
         }
         // try to fill the queue with pending tasks.
@@ -323,6 +330,7 @@ impl Scheduler {
         self.processing.clear();
         make_batch(&mut self.tasks, &mut self.processing, &self.config);
 
+        dbg!(&self.processing);
         log::debug!("prepared batch with {} tasks", self.processing.len());
 
         if !self.processing.is_empty() {
@@ -350,6 +358,9 @@ impl Scheduler {
                 created_at: Utc::now(),
                 tasks,
             };
+
+            // There is more work to do, notify the update loop
+            self.notifiy_if_not_empty();
 
             Ok(Pending::Batch(batch))
         } else {
@@ -380,30 +391,29 @@ fn make_batch(tasks: &mut TaskQueue, processing: &mut Vec<TaskId>, config: &Sche
         }
         Some(PendingTask { kind, .. }) => loop {
             match list.peek() {
-                Some(pending) if pending.kind == kind => match config.max_batch_size {
-                    Some(limit) if processing.len() >= limit.max(1) => break,
-                    _ => {
-                        let pending = list.pop().unwrap();
-                        processing.push(pending.id);
-
-                        // add the number of documents to count if we are scheduling document additions and
-                        // stop adding if we already have enough. We check that bound only
-                        // after adding the task to the batch, so a single update is always
-                        // processed even if it has to any documents in it.
-                        match pending.kind {
-                            TaskType::DocumentsUpdate { number }
-                            | TaskType::DocumentAddition { number } => {
-                                doc_count += number;
-
-                                if doc_count >= config.max_documents_per_batch.unwrap_or(usize::MAX)
-                                {
-                                    break;
-                                }
-                            }
-                            _ => (),
-                        }
+                Some(pending) if pending.kind == kind => {
+                    if processing.len() >= config.max_batch_size.max(1) {
+                        break;
                     }
-                },
+                    let pending = list.pop().unwrap();
+                    processing.push(pending.id);
+
+                    // add the number of documents to count if we are scheduling document additions and
+                    // stop adding if we already have enough. We check that bound only
+                    // after adding the task to the batch, so a single update is always
+                    // processed even if it has to any documents in it.
+                    match pending.kind {
+                        TaskType::DocumentsUpdate { number }
+                        | TaskType::DocumentAddition { number } => {
+                            doc_count += number;
+
+                            if doc_count >= config.max_documents_per_batch.unwrap_or(usize::MAX) {
+                                break;
+                            }
+                        }
+                        _ => (),
+                    }
+                }
                 _ => break,
             }
         },

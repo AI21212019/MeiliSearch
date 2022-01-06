@@ -5,9 +5,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use chrono::Utc;
-use futures::{pin_mut, Future};
+use futures::Future;
 use tokio::sync::{watch, RwLock};
-use tokio::time::interval_at;
+use tokio::time::{interval, interval_at, Interval};
 
 use super::batch::Batch;
 use super::error::Result;
@@ -50,42 +50,38 @@ where
         let mut notifier = self.notifier.take().unwrap();
 
         loop {
-            let notified = notifier.changed();
-            pin_mut!(notified);
-
-            tokio::select! {
-                _ = notified => {
-                    // we have been notified that a new update had been, we can start to debuf, and
-                    // see if we receive any more.
-
-                    if let WaitOrNever::Never = timer {
-                        // we are not currently debuffing, we can add a timer
-                        timer = match self.debounce_duration {
-                            Some(t) => WaitOrNever::wait(t),
-                            None => WaitOrNever::now(),
-                        };
-                    }
+            if timer.is_never() {
+                if notifier.changed().await.is_err() {
+                    break;
                 }
-                 _ = &mut timer => {
-                     // debounce time is elapsed, we can process the batch now
-                    timer = WaitOrNever::never();
 
-                    if let Err(e) = self.process_next_batch().await {
-                        log::error!("an error occured while processing an update batch: {}", e);
-                    }
-                }
+                timer = match self.debounce_duration {
+                    Some(t) => WaitOrNever::wait(dbg!(t)),
+                    None => WaitOrNever::now(),
+                };
             }
+
+            timer.await;
+
+            if let Err(e) = self.process_next_batch().await {
+                log::error!("an error occured while processing an update batch: {}", e);
+            }
+
+            // debounce time is elapsed, we can process the batch now
+            timer = WaitOrNever::never();
         }
     }
 
     async fn process_next_batch(&self) -> Result<()> {
         let pending = { self.scheduler.write().await.prepare().await? };
+        dbg!(&pending);
         match pending {
             Pending::Batch(mut batch) => {
                 for task in &mut batch.tasks {
                     task.events.push(TaskEvent::Processing(Utc::now()));
                 }
 
+                dbg!();
                 // the jobs are ignored
                 batch.tasks = {
                     self.scheduler
@@ -95,6 +91,7 @@ where
                         .await?
                 };
 
+                dbg!();
                 let performer = self.performer.clone();
 
                 let batch = performer.process_batch(batch).await;
@@ -103,10 +100,12 @@ where
             }
             Pending::Job(job) => {
                 let performer = self.performer.clone();
+                dbg!();
                 performer.process_job(job).await;
             }
             Pending::Nothing => (),
         }
+        dbg!();
 
         Ok(())
     }
@@ -129,12 +128,21 @@ where
 
 enum WaitOrNever {
     Wait(Pin<Box<dyn Future<Output = ()>>>),
-    Never,
+    Never(Interval),
 }
 
 impl WaitOrNever {
+    // Never is not actually never to prevent the loop from completely blocking and making any
+    // further progress.
     fn never() -> Self {
-        Self::Never
+        Self::Never(interval(Duration::from_secs(5)))
+    }
+
+    fn is_never(&self) -> bool {
+        match self {
+            Self::Never(_) => true,
+            _ => false,
+        }
     }
 
     fn wait(t: Duration) -> Self {
@@ -157,7 +165,7 @@ impl Future for WaitOrNever {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match *self {
             WaitOrNever::Wait(ref mut fut) => fut.as_mut().poll(cx),
-            WaitOrNever::Never => Poll::Pending,
+            WaitOrNever::Never(_) => Poll::Pending,
         }
     }
 }

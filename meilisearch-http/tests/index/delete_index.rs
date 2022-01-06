@@ -59,7 +59,9 @@ async fn loop_delete_add_documents() {
         assert_eq!(code, 202, "{}", response);
     }
 
+    dbg!();
     for task in tasks {
+        dbg!(task);
         let response = index.wait_task(task).await;
         assert_eq!(response["status"], "succeeded", "{}", response);
     }

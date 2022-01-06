@@ -47,9 +47,8 @@ pub struct IndexerOpts {
 pub struct SchedulerConfig {
     // The maximum number of updates that can be batched together. If None, this is unlimited. A
     // value of 0 is interpreted as 1.
-    #[structopt(long, hidden = true)]
-    pub max_batch_size: Option<usize>,
-
+    #[structopt(long, hidden = true, default_value = "1")]
+    pub max_batch_size: usize,
     // The maximum number of documents in a document batch. Since batch must contain at least one
     // batch for the schedulet to be able to make progress, this is ignored if a single update contains
     // more updates that what is specified.
