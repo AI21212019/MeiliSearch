@@ -294,6 +294,7 @@ impl Scheduler {
 
     pub async fn schedule_job(&mut self, job: Job) {
         self.jobs.push_back(job);
+        self.notify();
     }
 
     async fn fetch_pending_tasks(&mut self) -> Result<()> {
@@ -330,7 +331,6 @@ impl Scheduler {
         self.processing.clear();
         make_batch(&mut self.tasks, &mut self.processing, &self.config);
 
-        dbg!(&self.processing);
         log::debug!("prepared batch with {} tasks", self.processing.len());
 
         if !self.processing.is_empty() {

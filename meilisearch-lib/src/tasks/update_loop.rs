@@ -1,13 +1,9 @@
-use std::future::ready;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use chrono::Utc;
-use futures::Future;
 use tokio::sync::{watch, RwLock};
-use tokio::time::{interval, interval_at, Interval};
+use tokio::time::interval_at;
 
 use super::batch::Batch;
 use super::error::Result;
@@ -46,42 +42,32 @@ where
     }
 
     pub async fn run(mut self) {
-        let mut timer = WaitOrNever::never();
         let mut notifier = self.notifier.take().unwrap();
 
         loop {
-            if timer.is_never() {
-                if notifier.changed().await.is_err() {
-                    break;
-                }
-
-                timer = match self.debounce_duration {
-                    Some(t) => WaitOrNever::wait(dbg!(t)),
-                    None => WaitOrNever::now(),
-                };
+            if notifier.changed().await.is_err() {
+                break;
             }
 
-            timer.await;
+            if let Some(t) = self.debounce_duration {
+                let mut interval = interval_at(tokio::time::Instant::now() + t, t);
+                interval.tick().await;
+            };
 
             if let Err(e) = self.process_next_batch().await {
                 log::error!("an error occured while processing an update batch: {}", e);
             }
-
-            // debounce time is elapsed, we can process the batch now
-            timer = WaitOrNever::never();
         }
     }
 
     async fn process_next_batch(&self) -> Result<()> {
         let pending = { self.scheduler.write().await.prepare().await? };
-        dbg!(&pending);
         match pending {
             Pending::Batch(mut batch) => {
                 for task in &mut batch.tasks {
                     task.events.push(TaskEvent::Processing(Utc::now()));
                 }
 
-                dbg!();
                 // the jobs are ignored
                 batch.tasks = {
                     self.scheduler
@@ -91,7 +77,6 @@ where
                         .await?
                 };
 
-                dbg!();
                 let performer = self.performer.clone();
 
                 let batch = performer.process_batch(batch).await;
@@ -100,12 +85,10 @@ where
             }
             Pending::Job(job) => {
                 let performer = self.performer.clone();
-                dbg!();
                 performer.process_job(job).await;
             }
             Pending::Nothing => (),
         }
-        dbg!();
 
         Ok(())
     }
@@ -123,49 +106,5 @@ where
         batch.tasks = tasks;
         self.performer.finish(&batch).await;
         Ok(())
-    }
-}
-
-enum WaitOrNever {
-    Wait(Pin<Box<dyn Future<Output = ()>>>),
-    Never(Interval),
-}
-
-impl WaitOrNever {
-    // Never is not actually never to prevent the loop from completely blocking and making any
-    // further progress.
-    fn never() -> Self {
-        Self::Never(interval(Duration::from_secs(5)))
-    }
-
-    fn is_never(&self) -> bool {
-        match self {
-            Self::Never(_) => true,
-            _ => false,
-        }
-    }
-
-    fn wait(t: Duration) -> Self {
-        let interval = async move {
-            let mut interval = interval_at(tokio::time::Instant::now() + t, t);
-            interval.tick().await;
-        };
-
-        Self::Wait(Box::pin(interval))
-    }
-
-    fn now() -> Self {
-        Self::Wait(Box::pin(ready(())))
-    }
-}
-
-impl Future for WaitOrNever {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match *self {
-            WaitOrNever::Wait(ref mut fut) => fut.as_mut().poll(cx),
-            WaitOrNever::Never(_) => Poll::Pending,
-        }
     }
 }
